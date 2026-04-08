@@ -5,10 +5,13 @@ import asyncio
 import json
 import logging
 import re
+import ssl
 import time
 import urllib.request
 import urllib.parse
 import threading
+
+_ssl_ctx = ssl.create_default_context()
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -158,7 +161,7 @@ class SocialMonitor:
                     "Authorization": f"Bearer {self.bearer_token}",
                     "User-Agent": "NINABot/3.0",
                 })
-                with urllib.request.urlopen(req, timeout=10) as r:
+                with urllib.request.urlopen(req, timeout=10, context=_ssl_ctx) as r:
                     data = json.loads(r.read())
 
                 users = {u["id"]: u for u in data.get("includes",{}).get("users",[])}
@@ -206,7 +209,7 @@ class SocialMonitor:
                     "User-Agent": "Mozilla/5.0 (compatible; NINABot/3.0)",
                     "Accept": "application/rss+xml,application/xml,text/xml",
                 })
-                with urllib.request.urlopen(req, timeout=8) as r:
+                with urllib.request.urlopen(req, timeout=8, context=_ssl_ctx) as r:
                     content = r.read().decode("utf-8", errors="ignore")
 
                 # Parse RSS minimal

@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     MAX_POSITION_PCT:  float = 2.0       # taille max par trade (% du capital)
     DAILY_LOSS_LIMIT:  float = 10000.0   # perte journalière max en €
 
+    # ── Social / Twitter API ──────────────────────────────
+    TWITTER_BEARER_TOKEN: str = ""         # optionnel — laisser vide pour RSS fallback
+
     # ── Serveur API ───────────────────────────────────────
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000

@@ -286,9 +286,8 @@ def warm_up_prices(instruments: list, ibkr_prices: dict,
 def is_market_open(session: str = "US") -> bool:
     """Vérifie si le marché est ouvert (heure de Paris)."""
     try:
-        from datetime import timezone, timedelta
-        paris_tz = timezone(timedelta(hours=2))  # CEST
-        now = datetime.now(paris_tz)
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/Paris"))
         dow = now.weekday()
         if dow >= 5:  # week-end
             return False

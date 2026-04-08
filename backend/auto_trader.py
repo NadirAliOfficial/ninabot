@@ -22,6 +22,68 @@ log = logging.getLogger("bot.auto")
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION PAR MODE
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION PAR CATÉGORIE D'ACTIF (F-01 / F-02)
+# Chaque catégorie a ses propres paramètres EMA/RSI/ATR/risque
+# ─────────────────────────────────────────────────────────────
+CATEGORY_CFG = {
+    "STOCK": {
+        "ema_fast": 21, "ema_slow": 50,
+        "rsi_ob": 65,  "rsi_os": 35,
+        "atr_sl": 1.0, "atr_tp": 2.5,
+        "risk_pct": 1.0, "min_conviction": 45,
+        "sent_weight": 0.20,
+    },
+    "ETF": {
+        "ema_fast": 34, "ema_slow": 100,
+        "rsi_ob": 62,  "rsi_os": 38,
+        "atr_sl": 0.8, "atr_tp": 2.0,
+        "risk_pct": 0.8, "min_conviction": 50,
+        "sent_weight": 0.15,
+    },
+    "CRYPTO": {
+        "ema_fast": 20, "ema_slow": 100,
+        "rsi_ob": 72,  "rsi_os": 28,
+        "atr_sl": 2.0, "atr_tp": 4.0,
+        "risk_pct": 0.8, "min_conviction": 40,
+        "sent_weight": 0.40,
+    },
+    "FOREX": {
+        "ema_fast": 21, "ema_slow": 55,
+        "rsi_ob": 60,  "rsi_os": 40,
+        "atr_sl": 1.5, "atr_tp": 2.0,
+        "risk_pct": 0.5, "min_conviction": 55,
+        "sent_weight": 0.10,
+    },
+    "FUTURES": {
+        "ema_fast": 14, "ema_slow": 50,
+        "rsi_ob": 65,  "rsi_os": 35,
+        "atr_sl": 1.5, "atr_tp": 3.0,
+        "risk_pct": 1.0, "min_conviction": 50,
+        "sent_weight": 0.20,
+    },
+}
+
+SEC_TYPE_TO_CATEGORY = {
+    "STK": "STOCK", "ETF": "ETF",
+    "CRYPTO": "CRYPTO", "CASH": "FOREX",
+    "FUT": "FUTURES", "CFD": "STOCK",
+}
+
+def get_category(sec_type: str) -> str:
+    return SEC_TYPE_TO_CATEGORY.get(sec_type.upper(), "STOCK")
+
+def get_category_cfg(sec_type: str, mode_cfg: dict) -> dict:
+    """Merge mode config with category overrides. Category takes priority on technical params."""
+    cat_cfg = CATEGORY_CFG.get(get_category(sec_type), {})
+    merged = {**mode_cfg}
+    for k in ("ema_fast","ema_slow","rsi_ob","rsi_os","atr_sl","atr_tp",
+              "risk_pct","min_conviction","sent_weight"):
+        if k in cat_cfg:
+            merged[k] = cat_cfg[k]
+    return merged
+
+
 MODE_CFG = {
     "scalp": {
         "ema_fast":9, "ema_slow":21, "rsi_ob":65, "rsi_os":35,
@@ -131,7 +193,11 @@ class Indicators:
     @staticmethod
     def atr(highs:list, lows:list, closes:list, period:int=14) -> Optional[float]:
         n = min(len(closes), len(highs), len(lows))
-        if n < 2: return closes[-1] * 0.015 if closes else None
+        if n < 2:
+            if not closes: return None
+            p = closes[-1]
+            sym_upper = ""
+            return p * 0.02 if p < 1000 else p * 0.008
         trs = []
         for i in range(1, n):
             tr = max(highs[i]-lows[i],
@@ -288,6 +354,7 @@ class AutoTrader:
         self.ibkr         = ibkr
         self.risk         = risk_manager
         self.active       = False
+        self.permanent    = False   # F-03: redémarre automatiquement si crash
         self.mode         = "trend"
         self.cfg          = {**MODE_CFG["trend"]}
         self.active_inds  = {}
@@ -302,12 +369,12 @@ class AutoTrader:
         self._stop_event = threading.Event()
         self._retry_queue: list = []
         self._retry_lock = threading.Lock()
-        # Log circulaire — envoyé au frontend via WebSocket
         self.logs: deque = deque(maxlen=100)
         self.performance = {
             "total_trades":0,"wins":0,"losses":0,
             "win_rate":0.0,"last_3":[]
         }
+        self.category_stats: dict = {}  # F-01: stats par catégorie
 
     def _log(self, msg:str, level:str="info"):
         """Log local + push vers les clients WebSocket."""
@@ -322,7 +389,7 @@ class AutoTrader:
     # ── Contrôle ──────────────────────────────────────────────
 
     def start(self, mode:str, cfg:dict, instruments:list,
-              active_inds:dict, sentiment:dict) -> None:
+              active_inds:dict, sentiment:dict, permanent:bool=False) -> None:
         if self.active:
             self.stop()
             time.sleep(0.5)
@@ -333,6 +400,7 @@ class AutoTrader:
         self.active_inds = active_inds
         self.sentiment   = sentiment
         self.active      = True
+        self.permanent   = permanent
         self.trades_today.clear()
         self.consecutive_losses = 0
         self._stop_event.clear()
@@ -340,12 +408,18 @@ class AutoTrader:
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name=f"auto-{mode}")
         self._thread.start()
+        perm_str = " · MODE PERMANENT 🔄" if permanent else ""
         self._log(f"Démarré — mode={mode} · {len(instruments)} instruments · "
                   f"scan={self.cfg.get('scan_interval',30)}s · "
-                  f"conviction_min={self.cfg.get('min_conviction',50)}")
+                  f"conviction_min={self.cfg.get('min_conviction',50)}{perm_str}")
 
-    def stop(self) -> None:
-        self.active = False
+    def stop(self, force:bool=False) -> None:
+        """Arrête le trader. Si permanent=True, n'arrête que si force=True."""
+        if self.permanent and not force:
+            self._log("Mode permanent actif — utilisez force=True pour arrêter", "warn")
+            return
+        self.permanent = False
+        self.active    = False
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
@@ -428,6 +502,14 @@ class AutoTrader:
             self._stop_event.wait(interval)
 
         self._log("━━━ BOUCLE TERMINÉE ━━━")
+        # F-03: Redémarrage automatique si mode permanent et pas de kill switch
+        if self.permanent and not self.risk.killed:
+            self._log("🔄 Mode permanent — redémarrage dans 10s...", "warn")
+            time.sleep(10)
+            if self.permanent and not self.risk.killed:
+                self.active = True
+                self._stop_event.clear()
+                self._run_loop()
 
     # ── Circuit breakers ───────────────────────────────────────
 
@@ -450,21 +532,25 @@ class AutoTrader:
             self._log("⚠ AUCUN INSTRUMENT — envoyez la liste via le bouton ACTIVER", "warn")
             return
 
-        engine     = SignalEngine(self.mode, self.cfg, self.active_inds, self.sentiment)
         candidates = []
-        min_conv   = self.cfg.get("min_conviction", 50)
         no_price   = []
         seeded     = []
 
         active_inds_count = sum(1 for v in self.active_inds.values() if v)
         market_us = "🟢 OUVERT" if is_market_open("US") else "🔴 FERMÉ"
         market_eu = "🟢 OUVERT" if is_market_open("EU") else "🔴 FERMÉ"
-        self._log(f"Marché US {market_us} · EU {market_eu} · {active_inds_count} indicateurs · seuil={min_conv}")
+        global_min_conv = self.cfg.get("min_conviction", 50)
+        self._log(f"Marché US {market_us} · EU {market_eu} · {active_inds_count} indicateurs")
 
         for inst in self.instruments:
             sym      = inst.get("sym","")
             sec_type = inst.get("type","STK")
             cur      = inst.get("cur","USD")
+            category = get_category(sec_type)
+
+            # F-01 + F-02: config spécifique par catégorie d'actif
+            cat_cfg  = get_category_cfg(sec_type, self.cfg)
+            min_conv = cat_cfg.get("min_conviction", global_min_conv)
 
             history = self._get_or_create_history(sym, sec_type)
 
@@ -472,14 +558,9 @@ class AutoTrader:
             pdata = self.ibkr._prices.get(key, {})
             price = pdata.get("price", 0.0)
 
-            # Fallback: cache Yahoo Finance si prix live = 0
             if price <= 0:
                 price = cache_get(sym) or 0.0
-                if price > 0:
-                    pdata = {"price": price}  # pour l'affichage
-
             if price <= 0:
-                # Tentative Yahoo Finance en temps réel (throttled)
                 yf_price = get_yf_price_single(sym)
                 if yf_price:
                     price = yf_price
@@ -498,6 +579,7 @@ class AutoTrader:
             if len(history) < 5:
                 continue
 
+            engine = SignalEngine(self.mode, cat_cfg, self.active_inds, self.sentiment)
             result = engine.score(sym, history)
             score  = result.get("score", 0)
             direc  = result.get("direction","—")
@@ -505,31 +587,40 @@ class AutoTrader:
             rsi    = result.get("rsi")
             emoji  = "🟢" if score >= min_conv else "🔴" if score < 20 else "🟡"
 
-            # Log détaillé pour chaque instrument
             rsi_str = f" RSI={rsi:.0f}" if rsi else ""
             self._log(
-                f"{emoji} {sym}: score={score}/100 {direc}{rsi_str} | {reason}"
+                f"{emoji} [{category}] {sym}: score={score}/100 {direc}{rsi_str} | {reason}"
             )
 
-            if score >= min_conv and direc:
-                candidates.append({**inst, **result, "history": history, "live_price": price})
+            # F-01: stats par catégorie
+            cs = self.category_stats.setdefault(category, {"scanned":0,"signals":0})
+            cs["scanned"] += 1
 
-        # Résumé
+            if score >= min_conv and direc:
+                cs["signals"] += 1
+                candidates.append({**inst, **result,
+                                   "history": history, "live_price": price,
+                                   "category": category, "cat_cfg": cat_cfg})
+
         if no_price:
             self._log(f"⚪ {len(no_price)} sans prix: {', '.join(no_price[:10])}", "warn")
         if seeded:
             self._log(f"🌱 Seeded {len(seeded)} historiques: {', '.join(seeded[:5])}")
 
         if not candidates:
-            self._log(f"✗ Aucun signal ≥{min_conv} — augmentez les indicateurs ou baissez le seuil", "warn")
+            self._log(f"✗ Aucun signal — seuils par catégorie: "
+                      f"STOCK≥{CATEGORY_CFG['STOCK']['min_conviction']} "
+                      f"CRYPTO≥{CATEGORY_CFG['CRYPTO']['min_conviction']} "
+                      f"FOREX≥{CATEGORY_CFG['FOREX']['min_conviction']}", "warn")
             return
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         max_new = self.cfg.get("max_trades",5) - len(self.open_auto_orders)
-        self._log(f"✅ {len(candidates)} signal(s) valide(s) — exécution {min(len(candidates),max(1,max_new))} ordre(s)")
+        self._log(f"✅ {len(candidates)} signal(s) — exécution {min(len(candidates),max(1,max_new))} ordre(s)")
 
         for cand in candidates[:max(1, max_new)]:
-            self._log(f"⚡ SIGNAL FORT: {cand['sym']} {cand['direction']} score={cand['score']} @ {cand.get('live_price',0):.4f}")
+            self._log(f"⚡ [{cand['category']}] {cand['sym']} {cand['direction']} "
+                      f"score={cand['score']} @ {cand.get('live_price',0):.4f}")
             self._execute_signal(cand)
 
     def _get_or_create_history(self, sym:str, sec_type:str) -> PriceHistory:
@@ -561,7 +652,9 @@ class AutoTrader:
         lows    = list(history.lows)
         atr     = Indicators.atr(highs, lows, prices, 14) or price * 0.015
 
-        risk_pct = self.cfg.get("risk_pct", 1.0)
+        # F-02: utiliser le risk_pct de la config catégorie si disponible
+        eff_cfg  = cand.get("cat_cfg", self.cfg)
+        risk_pct = eff_cfg.get("risk_pct", self.cfg.get("risk_pct", 1.0))
         if self.consecutive_losses >= 2:
             risk_pct *= 0.5 ** min(self.consecutive_losses - 1, 3)
 
@@ -570,8 +663,8 @@ class AutoTrader:
             conviction=score, atr=atr, price=price, sec_type=sec_type,
         )
 
-        sl_dist  = atr * self.cfg.get("atr_sl", 1.5)
-        tp_dist  = atr * self.cfg.get("atr_tp", 3.0)
+        sl_dist  = atr * eff_cfg.get("atr_sl", self.cfg.get("atr_sl", 1.5))
+        tp_dist  = atr * eff_cfg.get("atr_tp", self.cfg.get("atr_tp", 3.0))
         sl_price = price - sl_dist if action=="BUY" else price + sl_dist
         tp_price = price + tp_dist if action=="BUY" else price - tp_dist
 
@@ -682,6 +775,7 @@ class AutoTrader:
     def get_status(self) -> dict:
         return {
             "active":             self.active,
+            "permanent":          self.permanent,
             "mode":               self.mode,
             "mode_desc":          MODE_CFG.get(self.mode,{}).get("description",""),
             "open_positions":     len(self.open_auto_orders),
@@ -691,6 +785,8 @@ class AutoTrader:
             "retry_queue":        len(self._retry_queue),
             "logs":               list(self.logs)[-20:],
             "performance":        self.performance,
+            "category_stats":     self.category_stats,
+            "category_cfg":       CATEGORY_CFG,
             "circuit_breakers":   {
                 "killed":      self.risk.killed,
                 "kill_reason": self.risk.kill_reason,

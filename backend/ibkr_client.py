@@ -329,9 +329,10 @@ class IBKRApp(EWrapper, EClient):
 
     def openOrder(self, orderId, contract, order, orderState):
         if orderId not in self._orders:
+            qty = order.cashQty if (contract.secType == "CRYPTO" and order.totalQuantity == 0) else order.totalQuantity
             self._orders[orderId] = OrderStatus(
                 orderId, contract.symbol, order.action,
-                order.totalQuantity, order.orderType, orderState.status)
+                qty, order.orderType, orderState.status)
         self._push({"type": "open_orders",
                     "orders": [o.to_dict() for o in self._orders.values()]})
 

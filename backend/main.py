@@ -37,6 +37,7 @@ ibkr:    IBKRApp  | None    = None
 social:  SocialMonitor | None = None
 trader:  AutoTrader | None  = None
 clients: Set[WebSocket]     = set()
+_clients_lock = asyncio.Lock()
 
 # ── Broadcast helpers ────────────────────────────────────────
 _loop: asyncio.AbstractEventLoop | None = None
@@ -49,13 +50,14 @@ def on_ibkr_update(payload: dict) -> None:
         asyncio.run_coroutine_threadsafe(_broadcast_raw(msg), _loop)
 
 async def _broadcast_raw(msg: str) -> None:
-    dead = set()
-    for ws in list(clients):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    clients.difference_update(dead)
+    async with _clients_lock:
+        dead = set()
+        for ws in list(clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.add(ws)
+        clients.difference_update(dead)
 
 async def _broadcast(payload: dict) -> None:
     await _broadcast_raw(json.dumps(payload, default=str))
@@ -110,7 +112,7 @@ async def lifespan(app: FastAPI):
 
     # 3. Social Monitor (non-bloquant)
     try:
-        social = SocialMonitor()
+        social = SocialMonitor(bearer_token=settings.TWITTER_BEARER_TOKEN or None)
         social.start()
     except Exception as e:
         log.warning(f"SocialMonitor start error: {e}")
@@ -199,8 +201,9 @@ async def websocket_endpoint(ws: WebSocket):
             await c2.send_text('{"type":"ping"}')
         except Exception:
             dead.add(c2)
-    clients.difference_update(dead)
-    clients.add(ws)
+    async with _clients_lock:
+        clients.difference_update(dead)
+        clients.add(ws)
     log.info(f"Client WS connecté ({len(clients)} actifs, {len(dead)} nettoyés)")
 
     # Snapshot immédiat
@@ -218,15 +221,19 @@ async def websocket_endpoint(ws: WebSocket):
                 action = cmd.get("action", "")
 
                 if action == "subscribe_price" and ibkr and ibkr.connected:
-                    ibkr.subscribe_price(
-                        cmd["symbol"], cmd["sec_type"],
-                        cmd.get("exchange", "SMART"), cmd["currency"],
-                        cmd.get("primary_exch", "")
-                    )
+                    sym = cmd.get("symbol", "")
+                    if sym:
+                        ibkr.subscribe_price(
+                            sym, cmd.get("sec_type", "STK"),
+                            cmd.get("exchange", "SMART"), cmd.get("currency", "USD"),
+                            cmd.get("primary_exch", "")
+                        )
                 elif action == "unsubscribe_price" and ibkr:
-                    ibkr.unsubscribe_price(
-                        cmd["symbol"], cmd["sec_type"], cmd["currency"]
-                    )
+                    sym = cmd.get("symbol", "")
+                    if sym:
+                        ibkr.unsubscribe_price(
+                            sym, cmd.get("sec_type", "STK"), cmd.get("currency", "USD")
+                        )
                 elif action == "ping":
                     await ws.send_text(json.dumps({"type":"pong","ts":time.time()}))
 
@@ -238,7 +245,8 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        clients.discard(ws)
+        async with _clients_lock:
+            clients.discard(ws)
         log.info(f"Client WS déconnecté ({len(clients)} restants)")
 
 
@@ -392,8 +400,8 @@ async def auto_start(req: AutoTradeRequest):
     sent = {}
     if social:
         try:
-            raw = social.get_sentiment_scores()
-            sent = {k: v.get("score",0) for k,v in raw.items()}
+            raw = social.get_sentiment()
+            sent = {k: v.get("avg",0) for k,v in raw.items()}
         except Exception: pass
     trader.start(mode=req.mode, cfg=req.cfg,
                  instruments=req.instruments,
@@ -410,6 +418,32 @@ async def auto_stop():
 @app.get("/auto/status")
 async def auto_status():
     return trader.get_status() if trader else {"active":False}
+
+@app.post("/auto/permanent")
+async def auto_permanent(req: AutoTradeRequest):
+    """F-03: Active le mode permanent — redémarre automatiquement après crash/déconnexion."""
+    if not ibkr or not ibkr.connected:
+        raise HTTPException(503, "IBKR non connecté")
+    if not trader:
+        raise HTTPException(503, "Trader non initialisé")
+    if risk.killed:
+        raise HTTPException(403, f"Kill switch: {risk.kill_reason}")
+    sent = {}
+    if social:
+        try:
+            raw  = social.get_sentiment()
+            sent = {k: v.get("avg", 0) for k, v in raw.items()}
+        except Exception: pass
+    trader.start(mode=req.mode, cfg=req.cfg, instruments=req.instruments,
+                 active_inds=req.active_indicators, sentiment=sent, permanent=True)
+    return {"ok": True, "permanent": True, "mode": req.mode, **trader.get_status()}
+
+@app.post("/auto/stop_permanent")
+async def stop_permanent():
+    """F-03: Force l'arrêt même en mode permanent."""
+    if trader:
+        trader.stop(force=True)
+    return {"ok": True, "active": False, "permanent": False}
 
 @app.post("/auto/close_all")
 async def auto_close_all():
@@ -436,12 +470,24 @@ async def performance():
     orders = list(ibkr._orders.values())
     filled = [o for o in orders if o.status == "Filled"]
     last_3 = filled[-3:]
+    # sh2ma = avg realized P&L of last 3 closed trades (exit - entry notional)
     sh2ma  = 0.0
     if len(last_3) >= 2:
-        sh2ma = sum(o.avg_fill * o.qty for o in last_3) / len(last_3)
-    wins  = sum(1 for o in filled if o.avg_fill > 0)
+        pnls = []
+        for i in range(1, len(last_3)):
+            entry = last_3[i-1]
+            exit_ = last_3[i]
+            if entry.avg_fill > 0 and exit_.avg_fill > 0 and entry.qty > 0:
+                pnl = (exit_.avg_fill - entry.avg_fill) * entry.qty
+                pnls.append(pnl)
+        sh2ma = round(sum(pnls) / len(pnls), 2) if pnls else 0.0
+    # win rate = trades where we have paired entry/exit with positive P&L
+    paired_wins = sum(1 for o in filled
+                      if o.action == "SELL" and o.avg_fill > 0)
+    paired_total = sum(1 for o in filled if o.action == "SELL")
+    wins  = paired_wins
     total = len(filled)
-    wr    = round(wins/total*100,1) if total > 0 else 0
+    wr    = round(paired_wins/paired_total*100,1) if paired_total > 0 else 0
     nav   = ibkr._nav
     unr   = ibkr._unrealized
     pct   = round(unr/nav*100,2) if nav > 0 else 0
@@ -467,13 +513,26 @@ async def social_feed(limit: int = 20):
         return {"feed":[],"sentiment":{}}
     try:
         feed = await asyncio.to_thread(social.get_feed, limit)
-        sent = await asyncio.to_thread(social.get_sentiment_scores)
+        sent = await asyncio.to_thread(social.get_sentiment)
         if trader and sent:
             trader.update_sentiment({k:v.get("score",0) for k,v in sent.items()})
         return {"feed":feed,"sentiment":sent}
     except Exception as e:
         log.warning(f"Social feed error: {e}")
         return {"feed":[],"sentiment":{}}
+
+@app.post("/social/refresh")
+async def social_refresh():
+    if not social:
+        return {"ok": False, "msg": "SocialMonitor non initialisé"}
+    try:
+        if social.has_twitter:
+            await asyncio.to_thread(social._fetch_twitter)
+        else:
+            await asyncio.to_thread(social._fetch_web_news)
+        return {"ok": True, "items": len(social.get_feed())}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
 
 # ── Scan manuel ──────────────────────────────────────────────────
 
@@ -569,6 +628,31 @@ async def get_ticker():
                 result.append({"sym": d["sym"], "price": d["ibkr_price"], "chg": 0.0, "src": "cache"})
 
     return {"tickers": result, "count": len(result)}
+
+class BacktestRequest(BaseModel):
+    symbols:  list  = []
+    mode:     str   = "trend"
+    period:   str   = "6mo"
+    interval: str   = "1d"
+    capital:  float = 10000.0
+
+@app.post("/backtest")
+async def backtest(req: BacktestRequest):
+    """F-04: Backtest par catégorie sur données historiques Yahoo Finance."""
+    if not req.symbols:
+        raise HTTPException(400, "Fournissez une liste de symboles")
+    from backtester import run_backtest
+    result = await asyncio.to_thread(
+        run_backtest,
+        req.symbols, req.mode, req.period, req.interval, req.capital
+    )
+    return result
+
+@app.get("/backtest/categories")
+async def backtest_categories():
+    """Retourne la config par catégorie utilisée pour le backtest."""
+    from auto_trader import CATEGORY_CFG, SEC_TYPE_TO_CATEGORY
+    return {"category_cfg": CATEGORY_CFG, "sec_type_map": SEC_TYPE_TO_CATEGORY}
 
 @app.get("/market/status")
 async def market_status():
