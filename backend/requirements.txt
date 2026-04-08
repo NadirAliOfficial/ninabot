@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+ibapi
+python-dotenv
+pydantic
+pydantic-settings
+yfinance
+requests
