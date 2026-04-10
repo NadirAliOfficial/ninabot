@@ -196,7 +196,6 @@ class Indicators:
         if n < 2:
             if not closes: return None
             p = closes[-1]
-            sym_upper = ""
             return p * 0.02 if p < 1000 else p * 0.008
         trs = []
         for i in range(1, n):
