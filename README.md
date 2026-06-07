@@ -217,4 +217,4 @@ ninabot/
 Built with ❤️ for algorithmic traders · [Interactive Brokers TWS API](https://www.interactivebrokers.com/en/trading/tws.php)
 
 </div>
-<!-- updated: 2026-06-06 -->
+<!-- updated: 2026-06-07 -->
